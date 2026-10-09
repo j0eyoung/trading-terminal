@@ -36,6 +36,7 @@ export BYPASS_WARNING="$([ "$(opt skip_order_warnings)" = "true" ] && echo yes |
 export ALLOW_BLIND_TRADING="$([ "$(opt allow_trading_without_market_data)" = "true" ] && echo yes || echo no)"
 export RELOGIN_AFTER_TWOFA_TIMEOUT="$([ "$(opt relogin_after_2fa_timeout)" = "true" ] && echo yes || echo no)"
 export TWOFA_TIMEOUT_ACTION="$(opt twofa_timeout_action)"
+export TWOFA_DEVICE="$(opt twofa_device)"
 export AUTO_RESTART_TIME="$(opt auto_restart_time)"
 export TIME_ZONE="$(opt time_zone)"
 export TZ="$TIME_ZONE"

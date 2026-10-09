@@ -101,6 +101,10 @@ push, then press **Update** on the add-on page in Home Assistant.
 IB Gateway logs out regularly and may ask for a phone approval to log back in: if Trading
 Terminal says Interactive Brokers is not connected, check the IB Gateway add-on's Log tab.
 
+If IBKR asks you to choose between multiple second-factor methods, set `twofa_device`
+in the IB Gateway add-on's Configuration to the exact device name shown by IBKR.
+See the [IB Gateway setup guide](ib_gateway/DOCS.md) for details; phone approval is still required.
+
 If the sidebar page stays blank, set a port for 8501 in the add-on's Network section and open
 `http://homeassistant.local:8501` on your home network instead (that route has no login, so
 never forward it to the internet).

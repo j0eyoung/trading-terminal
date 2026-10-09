@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.4 - 2026-10-09
+- Added optional `twofa_device` to select the exact IBKR second-factor device when multiple methods are available. The value is passed to IBC through `TWOFA_DEVICE`; an empty value preserves the existing behavior. Phone approval is still required when requested by IBKR.
+
 ## 0.1.3 - 2026-10-02
 - New switches, on by default: `skip_order_warnings`, `allow_trading_without_market_data` and `relogin_after_2fa_timeout`. With nobody at the screen, IBKR's warning pop-ups could hold API orders indefinitely; the Trading Terminal still asks you to review and submit every order.
 
