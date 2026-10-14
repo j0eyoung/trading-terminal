@@ -14,6 +14,12 @@
   const title = s => String(s).replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, c => c.toUpperCase());
 
   const S = { boot: null, fn: "PORT", sym: localStorage.getItem("sym") || "", token: 0, charts: [], timers: [], quotes: {}, broker: null, chat: [] };
+  // Per-screen settings (ranges, tabs, filters) kept in this browser between visits.
+  function pref(k, def) { try { const v = localStorage.getItem("pref:" + k); return v == null ? def : JSON.parse(v); } catch (e) { return def; } }
+  function setPref(k, v) { try { localStorage.setItem("pref:" + k, JSON.stringify(v)); } catch (e) { } }
+  // Recently viewed tickers, newest first.
+  const recent = () => pref("recent", []);
+  function remember(sym) { if (sym) setPref("recent", [sym, ...recent().filter(s => s !== sym)].slice(0, 12)); }
   const FN_GROUP = {};
   const STOCK = new Set(["DES", "GP", "N", "FA", "VAL", "ANR", "ERN", "SEC", "OMON", "BT"]);
 
@@ -27,10 +33,11 @@
     return j;
   }
   const post = (path, body) => api(path, null, body || {});
-  function toast(text, kind = "") {
+  function toast(text, kind = "", ms = 7000) {
     const d = document.createElement("div");
-    d.className = "toast " + kind; d.textContent = text;
-    $("#toasts").append(d); setTimeout(() => d.remove(), 7000);
+    d.className = "toast " + kind; d.textContent = text; d.title = "Click to close";
+    d.onclick = () => d.remove();
+    $("#toasts").append(d); setTimeout(() => d.remove(), ms);
   }
 
   // ---------- html pieces ----------
@@ -100,8 +107,10 @@
     const [fn, sym] = routeFn();
     const screen = SCREENS[fn];
     cleanup();
-    S.fn = fn; if (sym) { S.sym = sym; localStorage.setItem("sym", sym); }
-    buildNav();
+    S.fn = fn; if (sym) { S.sym = sym; try { localStorage.setItem("sym", sym); } catch (e) { } }
+    if (STOCK.has(fn) && S.sym && !S.noRemember) remember(S.sym);
+    S.noRemember = false;
+    buildNav(); paintRecent();
     const main = $("#main"); main.scrollTop = 0;
     const token = ++S.token;
     if (!screen) { main.innerHTML = note(`Unknown function <b>${esc(fn)}</b>. Try the list on the left.`); return; }
@@ -165,10 +174,30 @@
       const r = await api("quotes", { s: syms.join(",") });
       Object.assign(S.quotes, r.quotes);
       $$(".q[data-s]").forEach(el => paintQuote(el));
-      $("#mode").dataset.stream = r.stream ? "1" : "";
     } catch (e) { /* keep last values */ }
     polling = false;
+    liveSync();
   }
+  // Live quotes pushed by the server (api/live, server-sent events) for whatever symbols are on screen.
+  const live = { es: null, key: "", on: false, fails: 0 };
+  function liveSync(force) {
+    if (document.hidden || live.fails > 5) return;
+    const syms = [...new Set($$(".q[data-s]").map(s => s.dataset.s))].sort().slice(0, 80);
+    const key = syms.join(",");
+    if (!force && key === live.key && live.es) return;
+    liveStop(); live.key = key;
+    if (!syms.length) return;
+    const es = live.es = new EventSource("api/live?s=" + encodeURIComponent(key));
+    es.onopen = () => { live.on = true; live.fails = 0; };
+    es.onmessage = e => {
+      const d = JSON.parse(e.data);
+      for (const [s, q] of Object.entries(d.quotes)) S.quotes[s] = { ...(S.quotes[s] || {}), ...q };
+      $$(".q[data-s]").forEach(el => d.quotes[el.dataset.s] && paintQuote(el));
+      $("#mode").title = d.stream === "live" ? "Prices: live stream" : "Prices: every few seconds";
+    };
+    es.onerror = () => { live.on = false; if (es.readyState === 2) { live.fails++; live.es = null; } };
+  }
+  function liveStop() { if (live.es) { live.es.close(); live.es = null; } live.on = false; }
   function paintQuote(el) {
     const q = S.quotes[el.dataset.s]; if (!q) return;
     const f = el.dataset.f; let txt, cls = "";
@@ -198,11 +227,17 @@
       const rows = syms.map(s => { const q = S.quotes[s] || {}; return `<tr class="go" data-go="${esc(s)}"><td><b>${esc(s)}</b></td><td class="spark">${q.spark ? window.spark(q.spark, q.prev_close) : ""}</td><td>${qspan(s)}</td><td>${qspan(s, "pct")}</td></tr>`; }).join("");
       const html = `<section class="panel"><div class="ph"><h2>${esc(w.active)}</h2><div class="r"><a class="btn sm" href="#/MON">Edit</a></div></div>
         <div class="tw"><table class="t compact"><tbody>${rows || `<tr><td class="s">Empty. Add a ticker from its page.</td></tr>`}</tbody></table></div></section>`;
-      $("#side").innerHTML = html;
-      const hold = S.holdings && S.holdings.length ? "" : "";
+      $("#side").innerHTML = html + `<div id="recent"></div>`;
+      paintRecent();
       $$("#side tr.go").forEach(tr => tr.onclick = () => go("DES", tr.dataset.go));
       $$(".q", $("#side")).forEach(paintQuote); pollQuotes();
     } catch (e) { $("#side").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  }
+
+  function paintRecent() {
+    const el = $("#recent"), rc = recent(); if (!el) return;
+    el.innerHTML = rc.length ? `<section class="panel"><div class="ph"><h2>Recent</h2><div class="r"><small>[ ] steps through</small></div></div><div class="pb">${rc.map(s =>
+      `<a class="chip ${s === S.sym ? "pos" : ""}" href="#/${STOCK.has(S.fn) ? S.fn : "DES"}/${encodeURIComponent(s)}">${esc(s)}</a>`).join("")}</div></section>` : "";
   }
 
   // ---------- command bar ----------
@@ -211,7 +246,10 @@
   function allFns() { return Object.entries(S.boot.functions).flatMap(([g, items]) => Object.entries(items).map(([k, n]) => ({ kind: "fn", k, n, g }))); }
   async function suggest() {
     const raw = cmd.value.trim().toUpperCase(); const seq = ++sugSeq;
-    if (!raw) { sug.hidden = true; return; }
+    if (!raw) {  // empty box: offer the recent tickers
+      sugItems = recent().slice(0, 8).map(s => ({ kind: "sym", k: s, n: "Recent" }));
+      paintSug(); return;
+    }
     const parts = raw.split(/\s+/), last = parts[parts.length - 1];
     const fns = allFns().filter(f => f.k.startsWith(last) || (last.length > 1 && f.n.toUpperCase().includes(last))).slice(0, 6);
     sugItems = parts.length > 1 ? fns.map(f => ({ ...f, sym: parts[0] })) : fns;
@@ -242,6 +280,7 @@
     go(STOCK.has(S.fn) ? S.fn : "DES", parts[0].replace(/[^A-Z0-9.\-^=]/g, ""));
   }
   cmd.addEventListener("input", suggest);
+  cmd.addEventListener("focus", () => { if (!cmd.value) suggest(); });
   cmd.addEventListener("keydown", e => {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       if (!sugItems.length) return; e.preventDefault();
@@ -255,8 +294,26 @@
     } else if (e.key === "Escape") { sug.hidden = true; cmd.blur(); }
   });
   cmd.addEventListener("blur", () => setTimeout(() => sug.hidden = true, 120));
+  // Keyboard shortcuts (ignored while typing in a box). The list is shown with "?" and on the HELP screen.
+  const KEYS = [["/", "Command bar"], ["[ ]", "Previous / next recent ticker"], ["D", "Overview"], ["G", "Chart"], ["N", "News"], ["F", "Financials"],
+    ["A", "Analysts"], ["E", "Earnings"], ["O", "Options"], ["B", "Buy ticket"], ["S", "Sell ticket"], ["P", "Portfolio"], ["W", "Watchlists"],
+    ["M", "World markets"], ["I", "Ask AI"], ["?", "This list"]];
+  const HOT = { d: "DES", g: "GP", n: "N", f: "FA", a: "ANR", e: "ERN", o: "OMON", p: "PORT", w: "MON", m: "WEI", i: "AI" };
+  const keyList = () => `<div class="kvg">${KEYS.map(([k, n]) => `<div><span>${esc(n)}</span><b>${esc(k)}</b></div>`).join("")}</div>`;
   document.addEventListener("keydown", e => {
-    if ((e.key === "/" || e.key === "`") && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) { e.preventDefault(); cmd.focus(); cmd.select(); }
+    if (e.ctrlKey || e.metaKey || e.altKey || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+    const k = e.key;
+    if (k === "/" || k === "`") { e.preventDefault(); cmd.focus(); cmd.select(); return; }
+    if (k === "[" || k === "]") {
+      const r = recent(); if (r.length < 2) return;
+      const i = r.indexOf(S.sym), next = r[((i < 0 ? 0 : i) + (k === "]" ? -1 : 1) + r.length) % r.length];
+      // moving through history shouldn't reorder it, so the route change skips remember() via a flag
+      S.noRemember = true; go(STOCK.has(S.fn) ? S.fn : "DES", next); return;
+    }
+    if (k === "?") { const d = document.createElement("div"); d.className = "toast"; d.innerHTML = `<b class="amber">SHORTCUTS</b>${keyList()}`; $("#toasts").append(d); setTimeout(() => d.remove(), 9000); return; }
+    const lk = k.toLowerCase();
+    if (lk === "b" || lk === "s") { if (S.sym) { S.ticket = { symbol: S.sym, side: lk === "b" ? "buy" : "sell" }; go("ORD", S.sym); } return; }
+    if (HOT[lk]) go(HOT[lk], STOCK.has(HOT[lk]) ? S.sym : "");
   });
 
   // ---------- chart helpers ----------
@@ -270,11 +327,11 @@
 
   // Portfolio
   SCREENS.PORT = async ({ el, chart, ok, every }) => {
-    let range = "1D", cur = S.broker;
+    let range = pref("port.range", "1D"), cur = S.broker, eq = null;
     const draw = async () => {
       const p = await api("portfolio", { broker: cur, range });
       if (!ok()) return;
-      if (!p.brokers.length) { el.innerHTML = note("No broker connected. " + Object.values(p.errors || {}).map(esc).join(" "), "err"); return; }
+      if (!p.brokers.length) { el.innerHTML = note((S.boot.pending ? "Connecting to your broker… " : "No broker connected. ") + Object.values(p.errors || {}).map(esc).join(" "), S.boot.pending ? "note box" : "err"); return; }
       cur = S.broker = p.broker;
       const a = p.account || {}, pos = p.positions || [];
       const dayPl = pos.reduce((t, x) => t + (x.day_pl || 0), 0), unreal = pos.reduce((t, x) => t + (x.unrealized_pl || 0), 0);
@@ -282,15 +339,25 @@
       el.innerHTML = errs + `<div class="grid g2"><div class="col">
         ${panel("Account " + p.mode, tiles([["Equity", money(a.equity)], ["Cash", money(a.cash)], ["Buying power", money(a.buying_power)], ["Day P/L", `<span class="${sgn(dayPl)}">${money(dayPl)}</span>`], ["Open P/L", `<span class="${sgn(unreal)}">${money(unreal)}</span>`]]).replace('class="tiles"', 'class="tiles pb"'),
           p.brokers.length > 1 ? seg(p.brokers, cur, "br") : "")}
-        ${panel("Equity", `<div class="pb"><div id="eq" class="chart"></div></div>`, seg(["1D", "1W", "1M", "3M", "1Y", "ALL"], range, "rg"))}
+        ${panel("Equity vs S&P 500", `<div class="pb"><div id="eq" class="chart"></div><div class="cap" id="eq-vs" style="padding-left:0"></div></div>`, seg(["1D", "1W", "1M", "3M", "1Y", "ALL"], range, "rg"))}
         ${panel("Positions", table(pos.map(x => ({ ...x })), [{ k: "symbol", h: "Symbol", f: r => symLink(r.symbol) }, "qty", { k: "avg_cost", h: "Avg cost", f: r => px(r.avg_cost) },
           { k: "last", h: "Last", f: r => /^[A-Z.\-]{1,6}$/.test(r.symbol) ? qspan(r.symbol) : "–" }, { k: "market_value", h: "Value", f: r => money(r.market_value) },
           { k: "day_pl", h: "Day P/L", f: r => `<span class="${sgn(r.day_pl)}">${money(r.day_pl)}</span>` }, { k: "unrealized_pl", h: "Open P/L", f: r => `<span class="${sgn(r.unrealized_pl)}">${money(r.unrealized_pl)}</span>` }], { empty: "No open positions." }), "", "")}
-        </div><div class="col">${panel("Allocation", `<div id="alloc" class="pb bars"><div class="loading">Loading</div></div>`)}
+        </div><div class="col">${pos.length ? panel("Open P/L by position", `<div class="pb bars">${plBars(pos.map(x => [x.symbol, x.unrealized_pl]))}</div>`) : ""}
+        ${panel("Allocation", `<div id="alloc" class="pb bars"><div class="loading">Loading</div></div>`)}
+        <div id="bytag"></div>
         ${panel("Recent orders", `<div id="ords"><div class="loading">Loading</div></div>`, `<a class="btn sm" href="#/ORD">Trade</a>`)}</div></div>`;
       const h = p.history || { t: [], v: [] };
-      chart(new window.TChart($("#eq"), { t: h.t, c: h.v, kind: "area", intraday: range === "1D" || range === "1W", baseline: h.v[0], yfmt: v => "$" + f2(v, 0), name: "Equity" }));
-      $$("[data-rg]", el).forEach(b => b.onclick = () => { range = b.dataset.rg; draw(); });
+      const spy = p.spy && p.spy.some(v => v != null) ? [{ name: "Same money in SPY", v: p.spy, color: "#5aa9ff", dash: [4, 3] }] : [];
+      if (eq) eq.destroy();
+      eq = new window.TChart($("#eq"), { t: h.t, c: h.v, kind: "area", intraday: range === "1D" || range === "1W", baseline: h.v[0], yfmt: v => "$" + f2(v, 0), name: "Equity", overlays: spy });
+      const ret = arr => { const v = (arr || []).filter(x => x != null); return v.length > 1 ? (v[v.length - 1] / v[0] - 1) * 100 : null; };
+      const mine = ret(h.v), bench = ret(p.spy);
+      $("#eq-vs").innerHTML = mine != null && bench != null ? `Over this range: you <span class="${sgn(mine)}">${pct(mine)}</span>, SPY <span class="${sgn(bench)}">${pct(bench)}</span> → <b class="${sgn(mine - bench)}">${mine - bench >= 0 ? "ahead" : "behind"} by ${f2(Math.abs(mine - bench))} pts</b>` : "";
+      api("journal").then(j => { if (!ok() || !j.by_tag.length) return;
+        $("#bytag").innerHTML = panel("Closed P/L by tag", `<div class="pb bars">${plBars(j.by_tag.map(t => [t.tag + ` (${t.trades}, ${f2(t.win_rate, 0)}% won)`, t.total]))}</div>`, `<a class="btn sm" href="#/JRNL">Journal</a>`);
+      }).catch(() => { });
+      $$("[data-rg]", el).forEach(b => b.onclick = () => { range = b.dataset.rg; setPref("port.range", range); draw(); });
       $$("[data-br]", el).forEach(b => b.onclick = () => { cur = S.broker = b.dataset.br; draw(); });
       bindTables(el);
       api("allocation", { broker: cur }).then(r => { if (!ok()) return; const tot = r.allocation.reduce((t, [, v]) => t + v, 0) || 1;
@@ -302,12 +369,19 @@
       pollQuotes();
     };
     await draw();
+    S.charts.push({ destroy: () => eq && eq.destroy() });
     every(() => { if (!document.hidden) draw(); }, 30000);
   };
+  // Horizontal profit/loss bars: [[label, value], ...], green right of zero, red left.
+  function plBars(rows) {
+    rows = rows.filter(([, v]) => num(v)).sort((a, b) => b[1] - a[1]);
+    const mx = Math.max(...rows.map(([, v]) => Math.abs(v)), 1);
+    return rows.map(([n, v]) => `<div class="b"><span>${esc(n)}</span><div class="tr"><div class="fl" style="width:${Math.abs(v) / mx * 100}%;background:${v >= 0 ? "var(--up)" : "var(--dn)"}"></div></div><em class="${sgn(v)}">${money(v, 0)}</em></div>`).join("") || note("Nothing yet.");
+  }
 
   // Trade ticket
   SCREENS.ORD = async ({ el, ok, sym, every }) => {
-    const brokers = S.boot.brokers; if (!brokers.length) { el.innerHTML = note("No broker connected.", "err"); return; }
+    const brokers = S.boot.brokers; if (!brokers.length) { el.innerHTML = S.boot.pending ? note("Connecting to your broker…", "note box") : note("No broker connected.", "err"); return; }
     const t = { symbol: sym || S.sym || "", side: "buy", type: "market", tif: "day", qty: 1, price: "", broker: S.broker || brokers[0], ...(S.ticket || {}) }; S.ticket = null;
     el.innerHTML = `<div class="grid g2"><div class="col">${panel("Order ticket " + S.boot.mode, `<form class="pb ticket" id="tk" autocomplete="off">
       <div class="two"><label class="f">Symbol<input class="in num" id="t-sym" value="${esc(t.symbol)}" style="text-transform:uppercase"></label>
@@ -317,6 +391,9 @@
       <label class="f">Order type<select class="in" id="t-type">${["market", "limit", "stop"].map(x => `<option ${x === t.type ? "selected" : ""}>${x}</option>`).join("")}</select></label></div>
       <div class="two"><label class="f" id="px-l">Price<input class="in num" id="t-px" type="number" step="any" value="${t.price}"></label>
       <label class="f">Time in force<select class="in" id="t-tif">${["day", "gtc"].map(x => `<option ${x === t.tif ? "selected" : ""}>${x}</option>`).join("")}</select></label></div>
+      <details id="sz-d" ${pref("ord.size", false) ? "open" : ""}><summary>SIZE BY RISK</summary><div class="two"><label class="f" title="What you'd lose if the stop is hit">Risk ($)<input class="in num" id="sz-risk" type="number" min="0" step="any"></label>
+        <label class="f">Stop price<input class="in num" id="sz-stop" type="number" step="any"></label></div>
+        <div class="row" style="margin-top:6px"><button type="button" class="btn" id="sz-go">Set quantity</button><span class="muted" id="sz-out"></span></div></details>
       <details><summary>BRACKET (optional)</summary><div class="two"><label class="f">Take profit<input class="in num" id="t-tp" type="number" step="any"></label><label class="f">Stop loss<input class="in num" id="t-sl" type="number" step="any"></label></div></details>
       <label class="f">Note for journal<input class="in" id="t-note" maxlength="200"></label>
       <div class="est"><span>Last <span id="t-last" class="dim">–</span></span><span id="t-est"></span></div>
@@ -329,6 +406,28 @@
     ["t-type", "t-qty", "t-px"].forEach(i => g(i).oninput = upd);
     g("t-sym").onchange = async () => { const s = g("t-sym").value.trim().toUpperCase(); if (!s) return; try { Object.assign(S.quotes, (await api("quotes", { s })).quotes); } catch (e) { } upd(); };
     g("t-sym").onchange(); upd();
+    // Position sizing: shares = risk / (entry - stop), capped by the plan's max position size.
+    let acct = null;
+    const loadAcct = async () => { try { acct = await api("account", { broker: g("t-br").value }); } catch (e) { acct = null; }
+      const pl = acct && acct.plan, eqv = acct && acct.account && acct.account.equity;
+      if (pl && eqv && pl.risk_per_trade && !g("sz-risk").value) g("sz-risk").value = Math.round(eqv * pl.risk_per_trade / 100);
+      g("sz-out").textContent = pl && pl.risk_per_trade ? `Plan: risk ${pl.risk_per_trade}% of ${money(eqv, 0)}` : "Set a risk % in My trading plan (PLAN) to prefill this."; };
+    g("t-br").onchange = () => { g("sz-risk").value = ""; loadAcct(); };
+    g("sz-d").ontoggle = () => setPref("ord.size", g("sz-d").open);
+    loadAcct();
+    g("sz-go").onclick = () => {
+      const s = g("t-sym").value.trim().toUpperCase(), q = S.quotes[s] || {};
+      const entry = g("t-type").value !== "market" && +g("t-px").value ? +g("t-px").value : q.last;
+      const risk = +g("sz-risk").value, stop = +g("sz-stop").value, out = g("sz-out");
+      if (!entry || !risk || !stop) { out.innerHTML = `<span class="warn">Need a price, a risk amount and a stop.</span>`; return; }
+      const per = t.side === "buy" ? entry - stop : stop - entry;
+      if (per <= 0) { out.innerHTML = `<span class="warn">For a ${t.side}, the stop must be ${t.side === "buy" ? "below" : "above"} ${px(entry)}.</span>`; return; }
+      let qty = Math.floor(risk / per), why = `${money(risk, 0)} ÷ ${px(per)} risk per share`;
+      const eqv = acct && acct.account && acct.account.equity, mp = acct && acct.plan && acct.plan.max_position;
+      if (eqv && mp && qty * entry > eqv * mp / 100) { qty = Math.floor(eqv * mp / 100 / entry); why += `, capped at your ${mp}% max position`; }
+      g("t-qty").value = qty; g("t-sl").value = stop; g("t-sl").closest("details").open = true; upd();
+      out.innerHTML = `<b>${qty} shares</b> (${why}). Stop loss filled in below.`;
+    };
     const body = () => ({ broker: g("t-br").value, symbol: g("t-sym").value.trim().toUpperCase(), side: t.side, qty: g("t-qty").value, type: g("t-type").value, price: g("t-px").value, tif: g("t-tif").value,
       take_profit: g("t-tp").value, stop_loss: g("t-sl").value, ref: (S.quotes[g("t-sym").value.trim().toUpperCase()] || {}).last, note: g("t-note").value });
     $("#tk").onsubmit = async e => {
@@ -386,8 +485,9 @@
       r = r || await api("alerts");
       el.innerHTML = `<div class="grid g2e">${panel("New price alert", `<form class="pb row" id="af"><input class="in num" id="a-s" placeholder="Ticker" size="8" value="${esc(sym || S.sym)}" style="text-transform:uppercase">
         <select class="in" id="a-d"><option value="above">goes above</option><option value="below">falls below</option></select><input class="in num" id="a-p" type="number" step="any" placeholder="Price" size="10"><button class="btn pri">Add</button></form>
-        ${note("Checked every 15 seconds on the server, even when this page is closed.", "cap")}`)}
+        ${note("Checked every 15 seconds on the server, even when this page is closed. When one hits, the AI adds a two-sentence explanation from the latest headlines and earnings dates.", "cap")}`)}
         ${panel("Active alerts", table(r.alerts.map((a, i) => ({ ...a, i })), [{ k: "symbol", h: "Symbol", f: x => symLink(x.symbol) }, "direction", { k: "price", h: "Price", f: x => px(x.price) }, { k: "now", h: "Now", f: x => qspan(x.symbol) },
+          { k: "triggered", h: "Status", cls: "l s", f: x => x.triggered != null ? `<span class="chip pos">Hit at ${px(x.triggered)}</span>${x.why ? `<div class="dim" style="max-width:420px;margin-top:3px">${esc(x.why)}</div>` : ""}` : `<span class="chip">Watching</span>` },
           { k: "x", h: "", f: x => `<button class="btn sm" data-rm="${x.i}">Remove</button>` }], { nogo: true, empty: "No alerts set." }))}</div>`;
       $("#af").onsubmit = async e => { e.preventDefault(); try { draw(await post("alerts", { action: "add", symbol: $("#a-s").value.trim().toUpperCase(), direction: $("#a-d").value, price: $("#a-p").value })); } catch (er) { toast(er.message, "bad"); } };
       $$("[data-rm]", el).forEach(b => b.onclick = async () => draw(await post("alerts", { action: "remove", index: b.dataset.rm })));
@@ -400,13 +500,13 @@
   SCREENS.DES = async ({ el, sym, chart, ok }) => {
     const o = await api("overview", { s: sym }); if (!ok()) return;
     const i = o.info || {};
-    el.innerHTML = `<div class="grid g2"><div class="col">${panel("Price", `<div class="pb"><div id="mini" class="chart"></div></div>`, seg(["1D", "1M", "1Y", "5Y"], "1Y", "rg"))}
+    el.innerHTML = `<div class="grid g2"><div class="col">${panel("Price", `<div class="pb"><div id="mini" class="chart"></div></div>`, seg(["1D", "1M", "1Y", "5Y"], pref("des.range", "1Y"), "rg"))}
       ${i.longBusinessSummary ? panel("About", `<div class="pb about">${esc(i.longBusinessSummary)}</div>`) : ""}</div>
       <div class="col">${panel("Key facts", kv(i, Object.keys(i).filter(k => k !== "longBusinessSummary" && k !== "website")) + (i.website ? `<div class="pb"><a href="${esc(i.website)}" target="_blank" rel="noopener">${esc(i.website)}</a></div>` : ""))}
       ${panel("Headlines", `<div id="hl" class="news"><div class="loading">Loading</div></div>`, `<a class="btn sm" href="#/N/${esc(sym)}">All news</a>`)}</div></div>`;
     let c = null; const load = async rg => { const h = await api("history", { s: sym, range: rg }); if (!ok()) return; const cfg = { t: h.t, c: h.c, intraday: h.intraday, kind: "area", baseline: h.prev_close, name: sym }; if (c) c.set(cfg); else c = chart(new window.TChart($("#mini"), cfg)); };
-    $$("[data-rg]", el).forEach(b => b.onclick = () => { $$("[data-rg]", el).forEach(x => x.classList.toggle("on", x === b)); load(b.dataset.rg); });
-    load("1Y");
+    $$("[data-rg]", el).forEach(b => b.onclick = () => { $$("[data-rg]", el).forEach(x => x.classList.toggle("on", x === b)); setPref("des.range", b.dataset.rg); load(b.dataset.rg); });
+    load(pref("des.range", "1Y"));
     api("news", { s: sym, n: 6 }).then(n => ok() && ($("#hl").innerHTML = newsList(n.items))).catch(e => $("#hl") && ($("#hl").innerHTML = note(esc(e.message), "err")));
   };
   const newsList = items => items.length ? items.map(n => `<a href="${esc(n.url)}" target="_blank" rel="noopener"><div><div class="meta"><b>${esc(n.publisher)}</b> · ${esc(n.published)}</div><div class="tt">${esc(n.title)}</div></div>${n.thumb ? `<img loading="lazy" src="${esc(n.thumb)}" alt="">` : ""}</a>`).join("") : note("No headlines.");
@@ -444,7 +544,7 @@
 
   // News
   SCREENS.N = async ({ el, sym, ok }) => {
-    let sent = false;
+    let sent = pref("n.sent", false);
     const draw = async () => {
       const n = await api("news", { s: sym, n: 30, sent: sent ? 1 : "" }); if (!ok()) return;
       const sc = n.sentiment;
@@ -452,7 +552,7 @@
       el.innerHTML = panel("Headlines for " + sym, `<div class="news">${items.map(x => `<a href="${esc(x.url)}" target="_blank" rel="noopener"><div><div class="meta"><b>${esc(x.publisher)}</b> · ${esc(x.published)}${x.s != null && typeof x.s !== "object" ? ` · <span class="${sgn(+x.s)}">${/^-?[\d.]+$/.test(x.s) ? (x.s > 0 ? "+" : "") + x.s : esc(x.s)}</span>` : ""}</div><div class="tt">${esc(x.title)}</div></div>${x.thumb ? `<img loading="lazy" src="${esc(x.thumb)}" alt="">` : ""}</a>`).join("") || note("No headlines.")}</div>`,
         `<label class="chk"><input type="checkbox" id="sent" ${sent ? "checked" : ""}>Rate with AI</label>`) +
         (n.sentiment_pending ? note("AI is rating the headlines… this refreshes in a moment.") : "") + (n.sentiment_error ? note(esc(n.sentiment_error), "err") : "");
-      $("#sent").onchange = e => { sent = e.target.checked; draw(); };
+      $("#sent").onchange = e => { sent = e.target.checked; setPref("n.sent", sent); draw(); };
       if (n.sentiment_pending) setTimeout(() => ok() && draw(), 6000);
     };
     await draw();
@@ -460,13 +560,13 @@
 
   // Financials
   SCREENS.FA = async ({ el, sym, chart, ok }) => {
-    const st = { stmt: "income", q: false, row: 0 };
+    const st = { stmt: "income", q: false, row: 0, ...pref("fa", {}) };
     const draw = async () => {
       const d = await api("financials", { s: sym, stmt: st.stmt, q: st.q ? 1 : 0 }); if (!ok()) return;
       const cols = d.columns.slice(0, 8), rows = d.rows;
       el.innerHTML = panel("Financials", `<div class="pb"><div id="fc" class="chart sm"></div></div>` + (rows.length ? `<div class="tw tall"><table class="t compact"><thead><tr><th>Item</th>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${rows.map((r, i) => `<tr class="go" data-r="${i}"><td class="l" style="font-family:var(--sans)">${esc(r.name)}</td>${r.values.slice(0, 8).map(v => `<td>${v == null ? "–" : big(v)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : note("No data for this statement.")) + (d.source ? `<div class="cap">Source: ${esc(d.source)}. Click a row to chart it.</div>` : ""),
         seg([["income", "Income"], ["balance", "Balance sheet"], ["cashflow", "Cash flow"]], st.stmt, "sm") + `<label class="chk"><input type="checkbox" id="fq" ${st.q ? "checked" : ""}>Quarterly</label>`);
-      $$("[data-sm]", el).forEach(b => b.onclick = () => { st.stmt = b.dataset.sm; st.row = 0; draw(); }); $("#fq").onchange = e => { st.q = e.target.checked; draw(); };
+      $$("[data-sm]", el).forEach(b => b.onclick = () => { st.stmt = b.dataset.sm; st.row = 0; keep(); draw(); }); $("#fq").onchange = e => { st.q = e.target.checked; keep(); draw(); };
       const show = i => { const r = rows[i]; if (!r) return; const labels = cols.slice().reverse(), v = r.values.slice(0, 8).reverse();
         chart(new window.BarChart($("#fc"), { labels, series: [{ name: r.name, v, color: (x) => x >= 0 ? "#ffa62b" : "#ff4f4f" }] })).draw(); };
       $$("tr[data-r]", el).forEach(tr => tr.onclick = () => { show(+tr.dataset.r); $("#fc").scrollIntoView({ block: "nearest" }); });
@@ -535,7 +635,7 @@
 
   // Backtest
   SCREENS.BT = async ({ el, sym, chart, ok }) => {
-    const q = { strategy: "", period: "5y", capital: 10000 };
+    const q = { strategy: "", period: "5y", capital: 10000, ...pref("bt", {}) };
     const draw = async () => {
       const d = await api("backtest", { s: sym, ...q }); if (!ok()) return;
       q.strategy = d.strategy;
@@ -548,7 +648,7 @@
         ${panel("Equity vs buy & hold", `<div class="pb"><div id="be" class="chart"></div></div>`)}
         ${panel("Trades", table(d.trades || [], null, { nogo: true, tall: true, empty: "No trades." }))}`}</div>`;
       $("#bf").onsubmit = e => { e.preventDefault(); const strat = $("#b-s").value; if (strat !== d.strategy) { q.strategy = strat; Object.keys(q).filter(k => !["strategy", "period", "capital"].includes(k)).forEach(k => delete q[k]); } else $$("[data-p]", el).forEach(i => q[i.dataset.p] = i.value);
-        q.period = $("#b-p").value; q.capital = $("#b-c").value; draw(); };
+        q.period = $("#b-p").value; q.capital = $("#b-c").value; setPref("bt", q); draw(); };
       if (d.equity && $("#be")) chart(new window.TChart($("#be"), { t: d.equity.t, c: d.equity.v, kind: "line", color: "#ffa62b", name: "Strategy", yfmt: v => "$" + f2(v, 0), overlays: [{ name: "Buy & hold", v: d.benchmark.v, color: "#5aa9ff" }] }));
     };
     await draw();
@@ -611,7 +711,7 @@
 
   // Ideas
   SCREENS.IDEA = async ({ el, ok }) => {
-    let list = "";
+    let list = pref("idea", "");
     const draw = async () => {
       const d = await api("ideas", { list }); if (!ok()) return;
       if (d.pending || d.error) { el.innerHTML = note(d.error ? esc(d.error) : "Scanning the S&P 500 first… this takes a minute.", d.error ? "err" : "note box"); if (!d.error) setTimeout(() => ok() && draw(), 8000); return; }
@@ -621,7 +721,7 @@
           { k: "passed", h: "Score", f: r => `${r.passed}/${r.total}` }, { k: "checks", h: "Checks", cls: "l s", f: r => r.checks.map(c => `<span class="chip ${c.state ? "y" : "n"}">${esc(c.label)}${c.pending ? "…" : ""}</span>`).join("") }]))}
         ${d.deep_pending ? note("Running the deeper checks in the background… refreshing.") : ""}
         ${panel("What the checks mean", `<div class="pb list">${d.explain.map(([a, b]) => `<div class="it"><b class="amber">${esc(a)}</b> <span class="dim">${esc(b)}</span></div>`).join("")}</div>`)}</div>`;
-      $$("[data-il]", el).forEach(b => b.onclick = () => { list = b.dataset.il; draw(); });
+      $$("[data-il]", el).forEach(b => b.onclick = () => { list = b.dataset.il; setPref("idea", list); draw(); });
       if (d.deep_pending) setTimeout(() => ok() && draw(), 8000);
     };
     await draw();
@@ -636,7 +736,7 @@
 
   // Predictions
   SCREENS.PRED = async ({ el, ok }) => {
-    let topic = "Fed & rates", qtext = "";
+    let topic = pref("pred", "Fed & rates"), qtext = "";
     const draw = async () => {
       const d = await api("predictions", { topic, q: qtext }); if (!ok()) return;
       topic = d.topic;
@@ -646,7 +746,7 @@
         ${d.events.length ? `<div class="grid gauto">${d.events.map(ev).join("")}</div>` : (d.blocked ? "" : note("No matching markets."))}
         ${Object.entries(d.errors || {}).filter(() => !d.blocked).map(([k, v]) => note(`${esc(k)}: ${esc(v)}`, "cap")).join("")}
         ${d.ibkr ? panel("ForecastEx products", `<form class="pb row" id="pf"><input class="in" id="pc" size="30" value="${esc((d.codes || []).join(" "))}"><button class="btn">Save codes</button></form>`) : ""}</div>`;
-      $$("[data-tp]", el).forEach(b => b.onclick = () => { topic = b.dataset.tp; draw(); });
+      $$("[data-tp]", el).forEach(b => b.onclick = () => { topic = b.dataset.tp; setPref("pred", topic); draw(); });
       $("#pq").onchange = e => { qtext = e.target.value; draw(); };
       if ($("#pf")) $("#pf").onsubmit = async e => { e.preventDefault(); await post("predictions", { codes: $("#pc").value }); draw(); };
     };
@@ -655,11 +755,11 @@
 
   // Screens
   SCREENS.SCR = async ({ el, ok }) => {
-    let name = "";
+    let name = pref("scr", "");
     const draw = async () => {
       const d = await api("screens", { name }); if (!ok()) return; name = d.name;
       el.innerHTML = panel("Screens", `<div class="pb row">${seg(d.names, name, "sc")}</div>` + table(d.rows, null, { tall: true, empty: "No results right now." }));
-      $$("[data-sc]", el).forEach(b => b.onclick = () => { name = b.dataset.sc; draw(); }); bindTables(el);
+      $$("[data-sc]", el).forEach(b => b.onclick = () => { name = b.dataset.sc; setPref("scr", name); draw(); }); bindTables(el);
     };
     await draw();
   };
@@ -776,6 +876,8 @@
       <ul><li><b>A ticker</b> opens its overview: <code>NVDA</code></li><li><b>Ticker + function</b> goes straight to a screen: <code>NVDA GP</code> (chart), <code>AAPL N</code> (news), <code>TSLA OMON</code> (options)</li>
       <li><b>A function code</b> opens that screen: <code>PORT</code>, <code>WEI</code>, <code>IDEA</code>, <code>AI</code></li></ul>
       <p>On a phone, use the bottom tabs and the row of chips under the top bar. Click any column heading in a table to sort it. Prices on screen update every few seconds.</p>
+      <h3>Keyboard shortcuts</h3>${keyList()}
+      <p class="dim">Each screen remembers its settings (chart range and indicators, statement, screen, idea list) in this browser, and the box at the top lists your recent tickers when it's empty.</p>
       <h3>Functions</h3>${Object.entries(S.boot.functions).map(([g, items]) => `<p><b>${g}</b>: ${Object.entries(items).map(([k, n]) => `<a href="#/${k}"><code>${k}</code></a> ${esc(n)}`).join(" · ")}</p>`).join("")}
       <p class="dim">Version ${esc(S.boot.version)}. This tool shows data and places orders you confirm; it does not give investment advice.</p></div>`);
   };
@@ -787,24 +889,47 @@
   }
   async function events() {
     let since = 0;
-    const tick = async () => { try { const r = await api("events", { since }); r.events.forEach(e => toast(e.text, e.kind === "alert" ? "good" : "")); since = r.last; } catch (e) { } };
+    let first = true;
+    const tick = async () => {
+      try {
+        const r = await api("events", { since });
+        if (!first) r.events.forEach(e => toast(e.kind === "alert-why" ? "Why: " + e.text : e.text, e.kind === "alert" ? "good" : "", e.kind === "alert-why" ? 20000 : 7000));
+        since = r.last; first = false;  // the first call only learns where the list is, so old events don't replay on every page load
+        if (r.events.some(e => e.kind.startsWith("alert")) && S.fn === "ALRT") render();
+      } catch (e) { }
+    };
     await tick(); setInterval(tick, 20000);
   }
+  // Broker connections and the AI check finish in the background on the server; until then boot says
+  // `pending` and we ask again, then redraw the screens that needed them.
+  async function bootFollowUp() {
+    for (let i = 0; i < 60 && S.boot.pending; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const b = await api("boot");
+        const changed = JSON.stringify(b.brokers) !== JSON.stringify(S.boot.brokers) || JSON.stringify(b.ai) !== JSON.stringify(S.boot.ai);
+        S.boot = b;
+        if (!S.broker) S.broker = b.brokers[0] || null;
+        if (!b.pending) Object.entries(b.broker_errors || {}).forEach(([k, v]) => toast(`${k}: ${v}`, "bad"));
+        if (changed && NEEDS_BOOT.has(S.fn)) render();
+      } catch (e) { }
+    }
+  }
+  const NEEDS_BOOT = new Set(["PORT", "ORD", "AI", "GAIN", "JRNL"]);
   async function start() {
     try { S.boot = await api("boot"); }
     catch (e) { $("#main").innerHTML = `<div class="err">Couldn't start: ${esc(e.message)}</div>`; return; }
     Object.entries(S.boot.functions).forEach(([g, items]) => Object.keys(items).forEach(k => FN_GROUP[k] = g));
     const m = $("#mode"); m.textContent = S.boot.mode; m.className = "mode " + (S.boot.live ? "live" : "paper");
     S.broker = S.boot.brokers[0] || null;
-    Object.entries(S.boot.broker_errors || {}).forEach(([k, v]) => toast(`${k}: ${v}`, "bad"));
+    if (!S.boot.pending) Object.entries(S.boot.broker_errors || {}).forEach(([k, v]) => toast(`${k}: ${v}`, "bad"));
     clock(); setInterval(clock, 30000);
     window.addEventListener("hashchange", render);
-    if (!location.hash) location.hash = "#/PORT"; else render();
-    sideWatch(); events();
-    setInterval(pollQuotes, 5000);
-    setInterval(() => !document.hidden && $$("#side .q").length && sideWatchRefresh(), 60000);
-    document.addEventListener("visibilitychange", () => !document.hidden && pollQuotes());
+    if (!location.hash) location.hash = pref("last", "#/PORT"); else render();
+    sideWatch(); events(); bootFollowUp();
+    setInterval(() => { if (!live.on) pollQuotes(); }, 5000);  // backup when the live stream can't connect
+    setInterval(() => !document.hidden && sideWatch(), 120000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollQuotes(); liveSync(true); } else liveStop(); });
   }
-  const sideWatchRefresh = () => sideWatch();
   start();
 })();

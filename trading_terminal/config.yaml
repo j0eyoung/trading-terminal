@@ -1,5 +1,5 @@
 name: Trading Terminal
-version: "0.2.0"
+version: "0.3.0"
 slug: trading_terminal
 description: Market data, research and paper/live trading through Alpaca and Interactive Brokers
 arch:

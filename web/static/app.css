@@ -214,7 +214,8 @@ table.t { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .ticket .side { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 1px solid var(--line2); border-radius: 2px; overflow: hidden; }
 .ticket .side button { border: 0; padding: 7px; background: none; cursor: pointer; font: 700 12px var(--mono); color: var(--dim); }
 .ticket .side button.on.b { background: var(--up); color: #000; } .ticket .side button.on.s { background: var(--dn); color: #fff; }
-.ticket .two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ticket .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.ticket .two .in { width: 100%; }
 .ticket .est { display: flex; justify-content: space-between; border-top: 1px solid var(--line2); padding-top: 8px; font: 600 13px var(--mono); }
 .confirm { border: 1px solid var(--amber); background: #120d05; padding: 10px; border-radius: 3px; display: flex; flex-direction: column; gap: 8px; }
 .confirm .d { font: 600 13px var(--mono); }

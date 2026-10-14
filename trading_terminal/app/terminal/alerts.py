@@ -48,3 +48,13 @@ def check() -> list[dict]:
     if fired:
         save(alerts)
     return fired
+
+
+def explain(fired: dict, why: str) -> None:
+    """Keeps the AI's short explanation on a triggered alert."""
+    alerts = load()
+    for a in alerts:
+        if a["symbol"] == fired["symbol"] and a["direction"] == fired["direction"] and a["price"] == fired["price"] \
+                and a.get("triggered") is not None:
+            a["why"] = why
+    save(alerts)

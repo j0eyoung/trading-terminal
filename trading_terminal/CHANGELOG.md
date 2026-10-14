@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 - 2026-10-14
+- **Opens straight away.** The page no longer waits for the broker connection and the AI check (which could take a minute after a restart). Screens that need the broker say "Connecting to your broker…" and fill in by themselves.
+- **Live prices.** Prices on screen are pushed from the server once a second from the Alpaca stream (every 5 seconds for indexes, futures and anything the stream doesn't cover), instead of the page asking every 5 seconds.
+- **Size by risk** on the order ticket: enter the dollars you're willing to lose and a stop price, and it sets the share count, capped by the max position size in My trading plan, and fills in the stop loss. The risk amount starts from your plan's risk per trade.
+- **Portfolio vs the S&P 500**: the equity chart shows what the same money would have done in SPY over the same range, with how far ahead or behind you are. New panels for open P/L by position and closed P/L by journal tag.
+- **Alerts explain themselves**: when a price alert hits, the AI adds a two-sentence "why" from the latest headlines, earnings dates and the market's move. It shows as a second notification and on the Alerts screen.
+- **Keyboard shortcuts**: `/` command bar, `[` `]` step through recent tickers, `D` `G` `N` `F` `A` `E` `O` for the stock screens, `B`/`S` buy or sell ticket, `P` portfolio, `W` watchlists, `M` markets, `I` Ask AI, `?` for the list. The command bar lists your recent tickers when empty, and the side column shows them too.
+- Each screen remembers its settings (ranges, statement, screen, idea list, prediction topic, backtest) and the app reopens on the last screen you used.
+- Notifications can be closed by clicking them; old ones no longer replay when the page reloads.
+- New smoke test (`python -m tests.smoke`) that checks every API route, the order safety checks and the page scripts before a release.
+
 ## 0.2.0 - 2026-10-07
 - **New terminal interface.** The slow Streamlit screens are replaced by a fast Bloomberg-style web app: function rail, command bar (type `NVDA GP`, `AAPL N`, `PORT`), dense panels and a live watchlist column. Every previous screen carries over, and prices update every few seconds.
 - **Phone friendly.** On a phone or the Home Assistant app it shows one panel at a time with bottom tabs (Home, Stock, Market, Trade, AI).

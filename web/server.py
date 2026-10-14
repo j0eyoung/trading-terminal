@@ -38,7 +38,7 @@ from terminal import (alerts, backtest, cache, collector, config, data, gains, i
 from terminal import indicators as ind  # noqa: E402
 from terminal.brokers import OrderRequest, connect_all  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 STATIC = Path(__file__).resolve().parent / "static"
 NY, LOCAL_TZ = "America/New_York", "America/Denver"
 SLOW = 1.0
@@ -90,6 +90,26 @@ def memo(key: str, ttl: float, fn, stale: bool = True):
 def forget(prefix: str) -> None:
     for k in [k for k in _memo if k.startswith(prefix)]:
         _memo.pop(k, None)
+
+
+def peek(key: str, ttl: float, fn, default=None):
+    """Like memo() but never waits: before the first value exists it starts fetching in the background and
+    returns `default`. For start-up data the page can fill in a moment later."""
+    if key in _memo:
+        return memo(key, ttl, fn)
+    with _memo_guard:
+        start = key not in _memo_busy
+        _memo_busy.add(key)
+    if start:
+        def first():
+            try:
+                memo(key, ttl, fn, stale=False)
+            except Exception as e:
+                log(f"[web] {key} failed: {e}")
+            finally:
+                _memo_busy.discard(key)
+        threading.Thread(target=first, daemon=True, name=f"peek-{key}").start()
+    return default
 
 
 def _timed(what: str, fn):
@@ -235,6 +255,53 @@ def quotes(symbols: list[str]) -> dict[str, dict]:
                 if q and q.get("last") is not None:
                     out[s] = q
     return out
+
+
+def live_api(p, b, pp):
+    """Server-sent quotes for the symbols on screen: once a second from the Alpaca stream when it's live, with
+    the regular quotes (every 5 s) for anything the stream doesn't cover. Only changed quotes are sent. The
+    connection closes after a few minutes and the browser reconnects by itself."""
+    syms = syms_of(p)
+    us = [s for s in syms if data.alpaca_symbol(s)]
+    stream.watch(us)
+    keys = ("last", "prev_close", "change", "change_pct", "bid", "ask", "day_high", "day_low", "volume")
+
+    def gen():
+        sent: dict[str, tuple] = {}
+        started = last_beat = time.time()
+        while time.time() - started < 300:
+            try:
+                base = memo(f"q5:{key_of(*syms)}", 5, lambda: quotes(syms))
+                out = {}
+                for s in syms:
+                    q = dict(base.get(s) or {})
+                    live = stream.get(s) if s in us else None
+                    if live and q.get("prev_close"):
+                        q.update(last=live["last"], bid=live["bid"], ask=live["ask"], change=live["last"] - q["prev_close"],
+                                 change_pct=(live["last"] / q["prev_close"] - 1) * 100,
+                                 day_high=max(q.get("day_high") or live["last"], live["last"]),
+                                 day_low=min(q.get("day_low") or live["last"], live["last"]))
+                    if q.get("last") is None:
+                        continue
+                    row = {k: q.get(k) for k in keys}
+                    sig = tuple(row.values())
+                    if sent.get(s) != sig:
+                        sent[s] = sig
+                        out[s] = row
+                if out:
+                    yield sse({"quotes": clean(out), "stream": stream.status()[0]})
+                    last_beat = time.time()
+                    if p.get("once"):  # tests: one message, then close
+                        return
+                elif time.time() - last_beat > 15:
+                    yield ": keep-alive\n\n"
+                    last_beat = time.time()
+            except Exception as e:
+                log(f"[web] live quotes: {e}")
+            time.sleep(1)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def q_api(p, b, pp):
@@ -522,9 +589,38 @@ def portfolio_api(p, b, pp):
         hist = hist[hist.diff().abs().fillna(0) < hist.median() * 0.5] if len(hist) > 3 else hist  # drop glitches
         idx = pd.DatetimeIndex(hist.index)
         out["history"] = {"t": ms(idx).tolist(), "v": [round(float(v), 2) for v in hist]}
+        out["spy"] = spy_alongside(hist, rng)
     except Exception as e:
         out["history"] = {"t": [], "v": [], "error": str(e)}
     return out
+
+
+SPY_RANGE = {"1D": "1D", "1W": "5D", "1M": "1M", "3M": "3M", "1Y": "1Y", "ALL": "5Y"}
+
+
+def spy_alongside(hist: pd.Series, rng: str) -> list | None:
+    """SPY closes lined up with the equity curve's timestamps (last close at or before each point), scaled so
+    both start at the same value: the line shows what the same money would have done in the S&P 500."""
+    if len(hist) < 2:
+        return None
+    spy = history("SPY", SPY_RANGE.get(rng, "1Y"))["Close"].dropna()
+    if spy.empty:
+        return None
+    left = pd.DataFrame({"t": ms(hist.index)})
+    right = pd.DataFrame({"t": ms(spy.index), "c": spy.to_numpy()})
+    c = pd.merge_asof(left, right, on="t", direction="backward")["c"]
+    first = c.first_valid_index()
+    if first is None:
+        return None
+    scaled = c / c[first] * float(hist.iloc[first])
+    return [None if pd.isna(v) else round(float(v), 2) for v in scaled]
+
+
+def account_api(p, b, pp):
+    """Equity and buying power plus the trading plan's limits, for sizing a trade on the order ticket."""
+    name = p.get("broker")
+    plan = profile.load()
+    return {"account": account(name), "plan": {k: plan.get(k) for k in ("risk_per_trade", "max_position", "account_size")}}
 
 
 def allocation_api(p, b, pp):
@@ -1161,6 +1257,45 @@ def events_api(p, b, pp):
     return {"events": [e for e in _events if e["id"] > since], "last": _event_id[0]}
 
 
+ALERT_PROMPT = """{symbol} just crossed my price alert: it is now {last} ({change}), and I asked to hear when it went \
+{direction} {price}. In two short sentences, say what most likely explains the move, using only the facts in \
+<context> (headlines, earnings date, market). If nothing there explains it, say so plainly. No advice."""
+
+
+def explain_alert(a: dict) -> None:
+    """Adds a two-sentence 'why' from the AI to a triggered alert, as a second notification."""
+    from terminal import ai
+
+    if not ai.provider():
+        return
+    s = a["symbol"]
+    try:
+        q = quotes([s, "SPY"])
+        ctx: dict = {"quote": q.get(s), "spy_today_pct": (q.get("SPY") or {}).get("change_pct")}
+        try:
+            ctx["headlines"] = [{k: n.get(k) for k in ("title", "publisher", "published")}
+                                for n in memo(f"news:{s}", 300, lambda: data.news(s))[:6]]
+        except Exception:
+            pass
+        if config.FINNHUB_API_KEY:
+            try:
+                up = sources.upcoming_earnings([s])
+                ctx["next_earnings"] = None if up.empty else str(up.iloc[0]["date"])
+                ctx["recent_earnings"] = memo(f"surp:{s}", 6 * 3600, lambda: sources.earnings_surprises(s)).head(2)
+            except Exception:
+                pass
+        last = (q.get(s) or {}).get("change_pct")
+        prompt = f"<context>{json.dumps(clean(ctx), default=str)}</context>\n\n" + ALERT_PROMPT.format(
+            symbol=s, last=f"{a['triggered']:,.2f}", change=f"{last:+.2f}% today" if last is not None else "change unknown",
+            direction=a["direction"], price=f"{a['price']:,.2f}")
+        why = ai.complete(prompt, "Answer in at most two sentences.", max_tokens=300, effort="low").strip()
+        if why:
+            alerts.explain(a, why)
+            push_event("alert-why", f"{s}: {why}")
+    except Exception as e:
+        log(f"[web] alert explanation for {s} failed: {e}")
+
+
 def background_loop():
     """Checks price alerts every 15 s (even with no browser open) and earnings dates hourly."""
     reminded: set = set()
@@ -1169,6 +1304,7 @@ def background_loop():
         try:
             for a in alerts.check():
                 push_event("alert", f"{a['symbol']} is {a['direction']} {a['price']:,.2f} (now {a['triggered']:,.2f})")
+                threading.Thread(target=explain_alert, args=(a,), daemon=True, name="alert-why").start()
         except Exception as e:
             log(f"[web] alert check failed: {e}")
         if config.FINNHUB_API_KEY and time.time() > next_earn:
@@ -1218,9 +1354,14 @@ FUNCTIONS = {
 
 
 def boot_api(p, b, pp):
-    bs, errors = brokers()
+    """Answers at once: broker connections and the AI check (both can take many seconds) come from the
+    background, and `pending` tells the page to ask again until they're in."""
+    conn = peek("boot:brokers", 30, lambda: (lambda bs, errs: (list(bs), errs))(*brokers()))
+    ai = peek("boot:ai", 60, ai_status)
     return {"version": VERSION, "mode": config.MODE_LABEL, "live": config.LIVE, "functions": FUNCTIONS,
-            "brokers": list(bs), "broker_errors": errors, "ai": ai_status(), "watchlists": watchlists_api({}, {}, {}),
+            "brokers": conn[0] if conn else [], "broker_errors": conn[1] if conn else {},
+            "ai": ai or {"provider": None, "claude_installed": False}, "pending": conn is None or ai is None,
+            "watchlists": watchlists_api({}, {}, {}),
             "stream": stream.status(), "keys": {"finnhub": bool(config.FINNHUB_API_KEY), "fmp": bool(config.FMP_API_KEY),
                                                 "fred": bool(config.FRED_API_KEY)}}
 
@@ -1238,7 +1379,7 @@ def startup():
 
 
 ROUTES = {
-    "boot": boot_api, "quotes": q_api, "history": history_api, "chart": chart_api, "overview": overview_api,
+    "boot": boot_api, "quotes": q_api, "live": live_api, "account": account_api, "history": history_api, "chart": chart_api, "overview": overview_api,
     "news": news_api, "analysts": analysts_api, "financials": financials_api, "valuation": valuation_api,
     "earnings": earnings_api, "filings": filings_api, "options": options_api, "backtest": backtest_api,
     "search": search_api, "portfolio": portfolio_api, "allocation": allocation_api, "orders": orders_api,
